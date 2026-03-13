@@ -70,7 +70,7 @@ WHERE _Fld10984 < @CutoffDate1C;
 PRINT 'Записей в основной таблице к удалению: ' + CAST(@TotalToDelete AS VARCHAR(20));
 
 DECLARE @TotalChng BIGINT;
-SELECT @TotalChng = COUNT_BIG(c.*)
+SELECT @TotalChng = COUNT_BIG(*)
 FROM _InfoRgChngR11005 c WITH (NOLOCK)
 INNER JOIN _InfoRg10981 r WITH (NOLOCK) ON c._Fld10982_RRRef = r._Fld10982_RRRef
 WHERE r._Fld10984 < @CutoffDate1C;
