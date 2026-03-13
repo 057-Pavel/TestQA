@@ -1,13 +1,14 @@
 -- ============================================================================
--- Скрипт очистки регистра сведений "ФискальныеОперации" (_InfoRg10981)
--- для 1С 8.x на MS SQL Server
+-- Очистка регистра "ФискальныеОперации" (_InfoRg10981) по дате
 --
--- ВАЖНО: 
---   1) Перед запуском ОБЯЗАТЕЛЬНО выгоните всех пользователей из 1С
---      или заблокируйте начало сеансов в консоли администрирования.
---   2) Сделайте РЕЗЕРВНУЮ КОПИЮ базы данных!
---   3) Модель восстановления рекомендуется SIMPLE на время удаления,
---      либо делайте периодический бэкап лога транзакций между пакетами.
+-- МЕТОД: копируем нужные записи → TRUNCATE → вставляем обратно.
+-- Работает за минуты вместо часов, т.к. TRUNCATE мгновенный,
+-- а INSERT с TABLOCK минимально логируется.
+--
+-- ВАЖНО:
+--   1) Выгоните ВСЕХ пользователей из 1С!
+--   2) Сделайте РЕЗЕРВНУЮ КОПИЮ базы!
+--   3) Убедитесь, что на диске достаточно места для временной копии.
 -- ============================================================================
 
 USE [Retail_POBEDA]
@@ -16,172 +17,97 @@ SET NOCOUNT ON;
 
 -- ===================== НАСТРОЙКИ =====================
 
--- Дата в терминах 1С: до какой даты удалять (не включая).
--- 1С хранит даты в SQL со смещением +2000 лет.
--- Пример: 2023-01-01 в 1С = 4023-01-01 в SQL.
---
--- Чтобы удалить всё ДО 1 января 2023 года (в терминах 1С):
+-- Удалить всё ДО этой даты. Формат 1С: +2000 лет.
+-- 2023-01-01 в 1С = 4023-01-01 в SQL
 DECLARE @CutoffDate1C DATETIME = '4023-01-01 00:00:00';
-
--- Альтернативный способ: автоматический расчёт.
--- Удалить записи старше 3 лет от текущей даты:
--- DECLARE @CutoffDate1C DATETIME = DATEADD(YEAR, 2000 - 3, GETDATE());
-
--- Размер пакета: сколько УНИКАЛЬНЫХ регистраторов обрабатывать за одну итерацию.
--- 50000 — агрессивный режим, быстрее. Если лог растёт — уменьшите до 10000-20000.
-DECLARE @BatchSize INT = 50000;
-
--- Пауза между пакетами в секундах (0 = без пауз, максимальная скорость).
-DECLARE @DelaySeconds INT = 0;
 
 -- ===================== КОНЕЦ НАСТРОЕК =====================
 
-DECLARE @RowsAffected INT = 1;
-DECLARE @TotalDeletedMain BIGINT = 0;
-DECLARE @TotalDeletedChng BIGINT = 0;
-DECLARE @DeletedMain INT;
-DECLARE @DeletedChng INT;
-DECLARE @BatchNum INT = 0;
 DECLARE @StartTime DATETIME = GETDATE();
-DECLARE @DelayStr VARCHAR(8);
-
-SET @DelayStr = '00:00:' + RIGHT('0' + CAST(@DelaySeconds AS VARCHAR(2)), 2);
-
--- ===================== ПРЕДВАРИТЕЛЬНАЯ ИНФОРМАЦИЯ =====================
+DECLARE @KeepCount BIGINT;
+DECLARE @TotalCount BIGINT;
 
 PRINT '============================================================';
-PRINT '  Очистка регистра ФискальныеОперации (_InfoRg10981)';
-PRINT '  База: Retail_POBEDA';
-PRINT '  Дата отсечения (SQL): ' + CONVERT(VARCHAR(20), @CutoffDate1C, 120);
-PRINT '  Дата отсечения (1С):  ' + CONVERT(VARCHAR(20), DATEADD(YEAR, -2000, @CutoffDate1C), 120);
-PRINT '  Размер пакета: ' + CAST(@BatchSize AS VARCHAR(10)) + ' регистраторов';
+PRINT '  Очистка регистра ФискальныеОперации';
+PRINT '  Метод: Copy → Truncate → Restore';
+PRINT '  Дата отсечения (1С): ' + CONVERT(VARCHAR(10), DATEADD(YEAR, -2000, @CutoffDate1C), 23);
 PRINT '  Старт: ' + CONVERT(VARCHAR(20), @StartTime, 120);
 PRINT '============================================================';
+
+-- ===== ШАГ 1: Узнаём объёмы =====
+
+SELECT @TotalCount = COUNT_BIG(*) FROM _InfoRg10981 WITH (NOLOCK);
+SELECT @KeepCount = COUNT_BIG(*) FROM _InfoRg10981 WITH (NOLOCK) WHERE _Fld10984 >= @CutoffDate1C;
+
 PRINT '';
-PRINT 'Подсчёт записей к удалению (основная таблица)...';
-
-DECLARE @TotalToDelete BIGINT;
-SELECT @TotalToDelete = COUNT_BIG(*)
-FROM _InfoRg10981 WITH (NOLOCK)
-WHERE _Fld10984 < @CutoffDate1C;
-
-PRINT 'Записей к удалению: ' + CAST(@TotalToDelete AS VARCHAR(20));
+PRINT 'Всего записей:    ' + CAST(@TotalCount AS VARCHAR(20));
+PRINT 'Оставляем (>=):   ' + CAST(@KeepCount AS VARCHAR(20));
+PRINT 'Удаляем (<):      ' + CAST(@TotalCount - @KeepCount AS VARCHAR(20));
 PRINT '';
 
-IF @TotalToDelete = 0
+IF @KeepCount = @TotalCount
 BEGIN
-    PRINT 'Нет записей для удаления. Выход.';
+    PRINT 'Нечего удалять — все записи новее даты отсечения.';
     RETURN;
 END
 
-IF OBJECT_ID('tempdb.dbo.#chlist') IS NOT NULL
-    DROP TABLE #chlist;
+-- ===== ШАГ 2: Копируем записи, которые ОСТАВЛЯЕМ =====
 
--- ===================== ОСНОВНОЙ ЦИКЛ УДАЛЕНИЯ =====================
+PRINT 'Шаг 1/4: Копируем ' + CAST(@KeepCount AS VARCHAR(20)) + ' записей во временную таблицу...';
 
-PRINT 'Начинаю удаление пакетами...';
-PRINT '';
+IF OBJECT_ID('dbo._InfoRg10981_keep', 'U') IS NOT NULL
+    DROP TABLE dbo._InfoRg10981_keep;
 
-WHILE (@RowsAffected > 0)
-BEGIN
-    SET @BatchNum = @BatchNum + 1;
+SELECT *
+INTO _InfoRg10981_keep
+FROM _InfoRg10981
+WHERE _Fld10984 >= @CutoffDate1C;
 
-    SELECT DISTINCT TOP (@BatchSize) _Fld10982_RRRef
-    INTO #chlist
-    FROM _InfoRg10981
-    WHERE _Fld10984 < @CutoffDate1C;
+PRINT '         Скопировано: ' + CAST(@@ROWCOUNT AS VARCHAR(20)) + ' записей.';
 
-    SET @RowsAffected = @@ROWCOUNT;
+-- ===== ШАГ 3: TRUNCATE обеих таблиц (мгновенно) =====
 
-    IF @RowsAffected = 0
-    BEGIN
-        DROP TABLE #chlist;
-        BREAK;
-    END
+PRINT 'Шаг 2/4: TRUNCATE таблицы изменений (_InfoRgChngR11005)...';
+TRUNCATE TABLE _InfoRgChngR11005;
+PRINT '         Готово.';
 
-    CREATE CLUSTERED INDEX IX_chlist ON #chlist (_Fld10982_RRRef);
+PRINT 'Шаг 3/4: TRUNCATE основной таблицы (_InfoRg10981)...';
+TRUNCATE TABLE _InfoRg10981;
+PRINT '         Готово.';
 
-    SET XACT_ABORT ON;
+-- ===== ШАГ 4: Вставляем обратно с минимальным логированием =====
 
-    BEGIN TRY
-        BEGIN TRANSACTION;
+PRINT 'Шаг 4/4: Вставляем ' + CAST(@KeepCount AS VARCHAR(20)) + ' записей обратно...';
 
-        DELETE _ir
-        FROM _InfoRgChngR11005 _ir
-        INNER JOIN #chlist ch ON _ir._Fld10982_RRRef = ch._Fld10982_RRRef;
+INSERT INTO _InfoRg10981 WITH (TABLOCK)
+SELECT * FROM _InfoRg10981_keep;
 
-        SET @DeletedChng = @@ROWCOUNT;
+PRINT '         Вставлено: ' + CAST(@@ROWCOUNT AS VARCHAR(20)) + ' записей.';
 
-        DELETE _ir
-        FROM _InfoRg10981 _ir
-        INNER JOIN #chlist ch ON _ir._Fld10982_RRRef = ch._Fld10982_RRRef;
+-- ===== ШАГ 5: Убираем временную таблицу =====
 
-        SET @DeletedMain = @@ROWCOUNT;
+DROP TABLE _InfoRg10981_keep;
 
-        COMMIT TRANSACTION;
-
-        SET @TotalDeletedMain = @TotalDeletedMain + @DeletedMain;
-        SET @TotalDeletedChng = @TotalDeletedChng + @DeletedChng;
-
-        RAISERROR('Пакет #%d | Осн: -%d (всего %I64d из %I64d, %d%%) | Изм: -%d | %s',
-            0, 1,
-            @BatchNum, @DeletedMain, @TotalDeletedMain, @TotalToDelete,
-            @TotalDeletedMain * 100 / @TotalToDelete,
-            @DeletedChng,
-            @StartTime) WITH NOWAIT;
-
-    END TRY
-    BEGIN CATCH
-        IF @@TRANCOUNT > 0
-            ROLLBACK TRANSACTION;
-
-        PRINT '';
-        PRINT '*** ОШИБКА в пакете #' + CAST(@BatchNum AS VARCHAR(10)) + ' ***';
-        PRINT 'Номер: ' + CAST(ERROR_NUMBER() AS VARCHAR(10));
-        PRINT 'Сообщение: ' + ERROR_MESSAGE();
-        PRINT 'Строка: ' + CAST(ERROR_LINE() AS VARCHAR(10));
-        PRINT '';
-        PRINT 'Удалено до ошибки: осн=' + CAST(@TotalDeletedMain AS VARCHAR(20))
-            + ', изм=' + CAST(@TotalDeletedChng AS VARCHAR(20));
-        PRINT 'Скрипт можно перезапустить — продолжит с оставшихся записей.';
-
-        DROP TABLE #chlist;
-        RETURN;
-    END CATCH
-
-    DROP TABLE #chlist;
-
-    IF @DelaySeconds > 0
-        WAITFOR DELAY @DelayStr;
-END
-
--- ===================== ИТОГ =====================
+-- ===== ИТОГ =====
 
 PRINT '';
 PRINT '============================================================';
 PRINT '  ГОТОВО!';
-PRINT '  Удалено из основной таблицы:  ' + CAST(@TotalDeletedMain AS VARCHAR(20));
-PRINT '  Удалено из таблицы изменений: ' + CAST(@TotalDeletedChng AS VARCHAR(20));
-PRINT '  Пакетов выполнено: ' + CAST(@BatchNum AS VARCHAR(10));
-PRINT '  Начало:      ' + CONVERT(VARCHAR(20), @StartTime, 120);
-PRINT '  Окончание:   ' + CONVERT(VARCHAR(20), GETDATE(), 120);
-PRINT '  Длительность: ' + CAST(DATEDIFF(MINUTE, @StartTime, GETDATE()) AS VARCHAR(10)) + ' мин.';
+PRINT '  Было:     ' + CAST(@TotalCount AS VARCHAR(20));
+PRINT '  Осталось: ' + CAST(@KeepCount AS VARCHAR(20));
+PRINT '  Удалено:  ' + CAST(@TotalCount - @KeepCount AS VARCHAR(20));
+PRINT '  Время:    ' + CAST(DATEDIFF(SECOND, @StartTime, GETDATE()) AS VARCHAR(10)) + ' сек.';
 PRINT '============================================================';
 GO
 
 
 -- ============================================================================
--- ПОСЛЕ УДАЛЕНИЯ (раскомментируйте и выполните отдельно):
+-- Для МАКСИМАЛЬНОЙ скорости INSERT: если модель восстановления FULL,
+-- временно переключите на SIMPLE перед запуском:
+--
+--   ALTER DATABASE [Retail_POBEDA] SET RECOVERY SIMPLE;
+--   -- ... запуск скрипта ...
+--   ALTER DATABASE [Retail_POBEDA] SET RECOVERY FULL;
+--
+-- В режиме SIMPLE + TABLOCK вставка будет минимально логироваться.
 -- ============================================================================
-
-/*
-USE [Retail_POBEDA]
-
-UPDATE STATISTICS _InfoRg10981;
-UPDATE STATISTICS _InfoRgChngR11005;
-
-ALTER INDEX ALL ON _InfoRg10981 REBUILD;
-ALTER INDEX ALL ON _InfoRgChngR11005 REBUILD;
-
--- DBCC SHRINKDATABASE (N'Retail_POBEDA');
-*/
